@@ -13,6 +13,7 @@ Supports both bundled dataset layouts:
 Run:
     python rr_gui.py
 """
+import json
 import re
 import sys
 from pathlib import Path
@@ -27,6 +28,18 @@ from scipy.signal import welch
 import datasets as ds
 from respiration_rate import (respiration_rate, count_breath_peaks,
                               bandpass_filter, EDR_LOWCUT, EDR_HIGHCUT, RESP_BAND)
+
+# ECG Signal Quality Assessment lives in the sibling ECG project. Make it
+# importable so bad-quality recordings can be auto-excluded during curation.
+# Kept optional: if the ECG project (or its deps) is unavailable the GUI still
+# runs, only the SQA auto-exclude button is disabled.
+sys.path.append(str(Path(__file__).resolve().parent.parent / "ECG"))
+try:
+    from ecg_sqa import ECGSQAEngine
+    _SQA_IMPORT_ERROR = ""
+except Exception as _exc:                       # optional dependency
+    ECGSQAEngine = None
+    _SQA_IMPORT_ERROR = str(_exc)
 
 DEFAULT_DATASET = ds.BIDMC_DIR
 
@@ -93,6 +106,12 @@ class RRGui(QtWidgets.QMainWindow):
         self.resize(1280, 900)
         self.dataset_dir = Path(DEFAULT_DATASET)
         self.records = []          # [(kind, path, name), ...]
+        # Curation state (persisted per folder in .rr_excluded.json):
+        self.overrides = {}        # name -> bool manual decision (True=exclude, keep=False)
+        self.sqa_bad = set()       # names ECG SQA judged "unacceptable" (cached)
+        self.sqa_assessed = False  # SQA has been run for the current folder
+        self.auto_sqa = ECGSQAEngine is not None   # auto-exclude bad ECG via SQA
+        self._busy = False         # reentrancy guard (SQA's processEvents pumps the loop)
         self._axes = None          # (ax_ecg, ax_edr) for live view cropping
         self._tmax = 0.0
         self._last_plot = None     # cached args of the last _plot, for redraws
@@ -123,6 +142,7 @@ class RRGui(QtWidgets.QMainWindow):
         self.next_btn.clicked.connect(lambda: self.step_record(1))
         controls.addWidget(self.next_btn, 1, 3)
         self.record_combo.currentIndexChanged.connect(self._update_nav_buttons)
+        self.record_combo.currentIndexChanged.connect(self._sync_exclude_check)
         refresh_btn = QtWidgets.QPushButton("Refresh")
         refresh_btn.clicked.connect(self.refresh_records)
         controls.addWidget(refresh_btn, 1, 4)
@@ -170,6 +190,45 @@ class RRGui(QtWidgets.QMainWindow):
         self.batch_btn.clicked.connect(self.evaluate_all)
         controls.addWidget(self.batch_btn, 3, 4, 1, 1)
 
+        # --- Curation ----------------------------------------------------- #
+        # Automatic: ECG Signal Quality Assessment flags unacceptable recordings
+        # and excludes them on load; the manual toggle below overrides per record.
+        self.auto_sqa_check = QtWidgets.QCheckBox("Auto-exclude bad ECG (SQA)")
+        self.auto_sqa_check.toggled.connect(self.toggle_auto_sqa)
+        if ECGSQAEngine is None:
+            self.auto_sqa_check.setEnabled(False)
+            self.auto_sqa_check.setToolTip(f"ECG SQA engine unavailable: {_SQA_IMPORT_ERROR}")
+        else:
+            self.auto_sqa_check.setToolTip(
+                "Automatically assess every record's ECG quality and exclude the "
+                "unacceptable ones. Runs once per folder; manual edits override it.")
+        controls.addWidget(self.auto_sqa_check, 4, 0, 1, 3)
+
+        # Manual: include/exclude the current record, overriding the SQA verdict.
+        self.exclude_check = QtWidgets.QCheckBox("Exclude this record (manual)")
+        self.exclude_check.setToolTip(
+            "Manually exclude/include the selected record. Overrides the SQA "
+            "verdict and is remembered in the dataset folder.")
+        self.exclude_check.toggled.connect(self.toggle_excluded)
+        controls.addWidget(self.exclude_check, 2, 5, 1, 2)
+        self.exclude_info = QtWidgets.QLabel("Excluded: 0 / 0")
+        controls.addWidget(self.exclude_info, 3, 5, 1, 2)
+
+        # Re-assess the whole folder now / discard manual edits.
+        self.sqa_btn = QtWidgets.QPushButton("Re-run SQA")
+        self.sqa_btn.clicked.connect(self.rerun_sqa)
+        if ECGSQAEngine is None:
+            self.sqa_btn.setEnabled(False)
+            self.sqa_btn.setToolTip(f"ECG SQA engine unavailable: {_SQA_IMPORT_ERROR}")
+        else:
+            self.sqa_btn.setToolTip("Re-assess every record's ECG quality now.")
+        controls.addWidget(self.sqa_btn, 4, 4, 1, 1)
+        self.clear_excl_btn = QtWidgets.QPushButton("Reset manual edits")
+        self.clear_excl_btn.setToolTip(
+            "Discard manual overrides and follow the SQA verdicts only.")
+        self.clear_excl_btn.clicked.connect(self.reset_overrides)
+        controls.addWidget(self.clear_excl_btn, 4, 5, 1, 2)
+
         # Metrics
         self.metrics_label = QtWidgets.QLabel("Select a record and click Estimate && Plot.")
         self.metrics_label.setStyleSheet("font-weight: bold;")
@@ -182,7 +241,8 @@ class RRGui(QtWidgets.QMainWindow):
         root.addWidget(self.toolbar)
         root.addWidget(self.canvas)
 
-        self.refresh_records()
+        # Defer the first load so the window paints before the auto-SQA pass runs.
+        QtCore.QTimer.singleShot(0, self.refresh_records)
 
     # ----------------------------------------------------------------- #
     def browse_dataset(self):
@@ -193,14 +253,23 @@ class RRGui(QtWidgets.QMainWindow):
             self.refresh_records()
 
     def refresh_records(self):
+        if self._busy:                          # ignore reentrant calls (processEvents)
+            return
         self.dataset_dir = Path(self.dataset_edit.text().strip())
+        self._load_excluded()
+        self._sync_auto_sqa_check()
         self.record_combo.clear()
         if not self.dataset_dir.exists():
             self.metrics_label.setText(f"Folder not found: {self.dataset_dir}")
             self.records = []
+            self._update_exclude_status()
             return
         self.records = discover_records(self.dataset_dir)
-        self.record_combo.addItems([short_label(name) for _, _, name in self.records])
+        # Automatic curation: assess ECG quality once per folder (cached after).
+        if (self.auto_sqa and not self.sqa_assessed
+                and ECGSQAEngine is not None and self.records):
+            self._run_sqa()
+        self.record_combo.addItems([self._combo_label(name) for _, _, name in self.records])
         if self.records:
             self.metrics_label.setText(
                 f"{len(self.records)} records loaded. Pick one and Estimate && Plot.")
@@ -208,6 +277,8 @@ class RRGui(QtWidgets.QMainWindow):
             self.metrics_label.setText(
                 f"No '*_Signals.csv' or '*_ecg.csv' files in {self.dataset_dir}")
         self._update_nav_buttons()
+        self._sync_exclude_check()
+        self._update_exclude_status()
 
     def step_record(self, delta):
         n = self.record_combo.count()
@@ -224,6 +295,188 @@ class RRGui(QtWidgets.QMainWindow):
         i = self.record_combo.currentIndex()
         self.prev_btn.setEnabled(n > 0 and i > 0)
         self.next_btn.setEnabled(n > 0 and i < n - 1)
+
+    # ----------------------------------------------------------------- #
+    # Curation: exclude bad-data records (persisted per dataset folder)
+    # ----------------------------------------------------------------- #
+    def _excluded_path(self):
+        """JSON file (in the dataset folder) that remembers the exclusions."""
+        return self.dataset_dir / ".rr_excluded.json"
+
+    def _load_excluded(self):
+        """Load curation state for the current folder (resets to defaults first)."""
+        self.overrides = {}
+        self.sqa_bad = set()
+        self.sqa_assessed = False
+        self.auto_sqa = ECGSQAEngine is not None
+        path = self._excluded_path()
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text())
+        except (ValueError, OSError):
+            return                              # corrupt/unreadable -> defaults
+        if isinstance(data, list):
+            # legacy format: a plain list of manually excluded record names
+            self.overrides = {name: True for name in data}
+        elif isinstance(data, dict):
+            self.overrides = {k: bool(v) for k, v in data.get("overrides", {}).items()}
+            self.sqa_bad = set(data.get("sqa_bad", []))
+            self.sqa_assessed = bool(data.get("sqa_assessed", False))
+            if ECGSQAEngine is not None:
+                self.auto_sqa = bool(data.get("auto_sqa", True))
+
+    def _save_excluded(self):
+        data = {
+            "auto_sqa": self.auto_sqa,
+            "sqa_assessed": self.sqa_assessed,
+            "sqa_bad": sorted(self.sqa_bad),
+            "overrides": dict(sorted(self.overrides.items())),
+        }
+        try:
+            self._excluded_path().write_text(json.dumps(data, indent=2))
+        except OSError as exc:
+            self.metrics_label.setText(f"Could not save exclusions: {exc}")
+
+    def _is_excluded(self, name):
+        """Effective verdict: manual override if present, else the SQA flag."""
+        if name in self.overrides:
+            return self.overrides[name]
+        return self.auto_sqa and name in self.sqa_bad
+
+    def _combo_label(self, name):
+        """Display label for a record, flagged with ✖ when excluded."""
+        label = short_label(name)
+        return f"✖ {label}" if self._is_excluded(name) else label
+
+    def _current_name(self):
+        i = self.record_combo.currentIndex()
+        return self.records[i][2] if 0 <= i < len(self.records) else None
+
+    def toggle_excluded(self, checked):
+        """Record a manual decision for the current record (overrides SQA)."""
+        i = self.record_combo.currentIndex()
+        name = self._current_name()
+        if name is None:
+            return
+        self.overrides[name] = bool(checked)
+        self.record_combo.setItemText(i, self._combo_label(name))
+        self._save_excluded()
+        self._update_exclude_status()
+
+    def _sync_exclude_check(self):
+        """Reflect the current record's exclusion state in the checkbox."""
+        name = self._current_name()
+        self.exclude_check.blockSignals(True)   # avoid re-triggering toggle_excluded
+        self.exclude_check.setEnabled(name is not None)
+        self.exclude_check.setChecked(name is not None and self._is_excluded(name))
+        self.exclude_check.blockSignals(False)
+
+    def _sync_auto_sqa_check(self):
+        """Reflect the loaded auto-SQA flag in its checkbox without re-triggering."""
+        self.auto_sqa_check.blockSignals(True)
+        self.auto_sqa_check.setChecked(self.auto_sqa)
+        self.auto_sqa_check.blockSignals(False)
+
+    def _update_exclude_status(self):
+        names = [name for _, _, name in self.records]
+        excl = [n for n in names if self._is_excluded(n)]
+        manual = sum(1 for n in excl if self.overrides.get(n) is True)
+        sqa = len(excl) - manual
+        self.exclude_info.setText(
+            f"Excluded: {len(excl)} / {len(names)}  (SQA {sqa}, manual {manual})")
+
+    def _refresh_combo_labels(self):
+        """Repaint every combo entry's ✖ flag from the current exclusion state."""
+        for i, (_, _, name) in enumerate(self.records):
+            self.record_combo.setItemText(i, self._combo_label(name))
+
+    def _run_sqa(self):
+        """Assess every record's ECG quality; cache the unacceptable ones.
+
+        Returns the number of records that failed to load/assess. Updates
+        ``self.sqa_bad`` and marks the folder assessed, then persists.
+        """
+        if self._busy:                          # already assessing -> no reentry
+            return 0
+        self._busy = True
+        try:
+            progress = QtWidgets.QProgressDialog(
+                "Assessing ECG signal quality...", "Cancel", 0, len(self.records), self)
+            progress.setWindowModality(QtCore.Qt.WindowModal)
+            progress.setWindowTitle("ECG SQA")
+            progress.show()
+
+            bad, n_failed = set(), 0
+            for k, (kind, path, name) in enumerate(self.records):
+                if progress.wasCanceled():
+                    break
+                progress.setValue(k)
+                QtWidgets.QApplication.processEvents()
+                try:
+                    rec = load_record(kind, path)
+                    res = ECGSQAEngine(rec.ecg, rec.fs).assess()
+                except Exception:
+                    n_failed += 1
+                    continue
+                if res["quality"] == "unacceptable":
+                    bad.add(name)
+            progress.close()
+        finally:
+            self._busy = False
+
+        self.sqa_bad = bad
+        self.sqa_assessed = True
+        self._save_excluded()
+        return n_failed
+
+    def rerun_sqa(self):
+        """Force a fresh SQA pass over the folder (manual overrides preserved)."""
+        if ECGSQAEngine is None:
+            QtWidgets.QMessageBox.warning(
+                self, "SQA unavailable",
+                f"Could not import the ECG SQA engine:\n{_SQA_IMPORT_ERROR}")
+            return
+        if not self.records:
+            QtWidgets.QMessageBox.warning(self, "No records", "No records found.")
+            return
+        n_failed = self._run_sqa()
+        self._refresh_combo_labels()
+        self._sync_exclude_check()
+        self._update_exclude_status()
+        self.metrics_label.setText(
+            f"SQA: assessed {len(self.records)} record(s) | "
+            f"{len(self.sqa_bad)} unacceptable (auto-excluded)"
+            f"{f' | {n_failed} failed' if n_failed else ''}. Manual overrides kept."
+        )
+
+    def toggle_auto_sqa(self, checked):
+        """Enable/disable automatic SQA exclusion (runs the pass on first enable)."""
+        self.auto_sqa = bool(checked)
+        if checked and not self.sqa_assessed and ECGSQAEngine is not None and self.records:
+            self._run_sqa()
+        self._save_excluded()
+        self._refresh_combo_labels()
+        self._sync_exclude_check()
+        self._update_exclude_status()
+
+    def reset_overrides(self):
+        """Discard all manual edits so the curation follows the SQA verdicts."""
+        if not self.overrides:
+            QtWidgets.QMessageBox.information(
+                self, "No manual edits", "There are no manual curation edits to reset.")
+            return
+        if QtWidgets.QMessageBox.question(
+                self, "Reset manual edits",
+                f"Discard {len(self.overrides)} manual override(s) and follow the "
+                f"SQA verdicts only?"
+        ) != QtWidgets.QMessageBox.Yes:
+            return
+        self.overrides = {}
+        self._save_excluded()
+        self._refresh_combo_labels()
+        self._sync_exclude_check()
+        self._update_exclude_status()
 
     # ----------------------------------------------------------------- #
     def estimate_and_plot(self):
@@ -253,11 +506,13 @@ class RRGui(QtWidgets.QMainWindow):
         mae = float(np.mean(np.abs(est - ref))) if est.size else float("nan")
         ref_overall = rec.reference_rate if rec.reference_rate else float("nan")
 
+        excluded_tag = "  ⚠ EXCLUDED (bad data)" if self._is_excluded(name) else ""
         self.metrics_label.setText(
             f"{name} | fs {rec.fs:.0f} Hz | R-peaks {res.r_peaks.size} | "
             f"RR estimated: {res.rate:.2f} bpm   "
             f"RR reference: {ref_overall:.2f} bpm   "
             f"MAE: {mae:.2f} bpm ({est.size} window{'s' if est.size != 1 else ''})"
+            f"{excluded_tag}"
         )
         self._last_plot = (rec, res, name, method, mae, ref_overall)
         self._plot(rec, res, name, method, mae, ref_overall)
@@ -380,10 +635,14 @@ class RRGui(QtWidgets.QMainWindow):
         progress.show()
 
         names, ests, refs = [], [], []
+        n_excluded = 0
         for k, (kind, path, name) in enumerate(self.records):
             if progress.wasCanceled():
                 break
             progress.setValue(k)
+            if self._is_excluded(name):      # curated out (SQA or manual)
+                n_excluded += 1
+                continue
             try:
                 rec = load_record(kind, path)
                 res = respiration_rate(rec.ecg, rec.fs, method=method, window=window)
@@ -409,7 +668,7 @@ class RRGui(QtWidgets.QMainWindow):
         corr = (float(np.corrcoef(ests, refs)[0, 1])
                 if ests.size > 1 and ests.std() and refs.std() else float("nan"))
         self.metrics_label.setText(
-            f"Dataset [{method}] | records {ests.size} | "
+            f"Dataset [{method}] | records {ests.size} (excluded {n_excluded}) | "
             f"MAE {mae:.2f} | RMSE {rmse:.2f} | bias {bias:+.2f} | r {corr:.3f} bpm"
         )
 

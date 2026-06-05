@@ -67,7 +67,7 @@ EDR_HIGHCUT = 40.0        # Hz, QRS band-pass high cut
 MIN_BREATH_INTERVAL = 1.17  # s, minimum spacing between breaths (-> max ~51 bpm)
 HEIGHT_FRAC = 0.95        # peak height threshold = HEIGHT_FRAC * mean(|edr window|)
 PROMINENCE_FRAC = 0.075   # prominence threshold = frac * (max_prom - min_prom)
-RESP_BAND = (0.1, 0.6)    # Hz, plausible respiration band for the PSD method
+RESP_BAND = (10 / 60.0, 30 / 60.0)  # Hz (10–30 brpm), plausible respiration band for the PSD method
 WINDOW = 32.0             # s, analysis window
 MIN_R_PEAKS = 4           # need at least this many R peaks to build an EDR signal
 
