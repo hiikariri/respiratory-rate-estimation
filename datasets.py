@@ -13,7 +13,7 @@ import glob
 import json
 import os
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -148,3 +148,104 @@ def _to_float(value) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+# --------------------------------------------------------------------------- #
+# Simultaneous five-devices dataset  (PhysioNet WFDB: *.hea/*.dat + *.aux)
+#
+# 13 participants, each recorded over four task phases (Rest, Walking, 2-Back,
+# Running). A record bundles several device ECGs plus a Hexoskin chest-band
+# breathing rate, used here as the respiratory-rate reference. Records carry 46
+# channels; only the chosen ECG lead and the reference are read.
+# --------------------------------------------------------------------------- #
+SIMULTANEOUS_REF = "HEXOSKIN/breathing_rate"
+# Candidate single-lead ECG channels, cleanest first (FAROS chest ECG is the
+# most reliable; HEXOSKIN is the motion-prone garment lead).
+SIMULTANEOUS_LEADS = ["FAROS/ECG", "HEXOSKIN/ECG_I", "SOT/EKG", "NEXUS/Sensor-B:EEG"]
+DEFAULT_SIM_LEAD = SIMULTANEOUS_LEADS[0]
+SIM_PHASES = ["Rest", "Walking", "2-Back", "Running"]
+
+
+@dataclass
+class SimultaneousRecord:
+    name: str
+    ecg: np.ndarray             # the chosen single lead
+    fs: float                   # Hz
+    time: np.ndarray            # s
+    ref_br: np.ndarray          # Hexoskin breathing rate, per sample (bpm)
+    phases: List[Tuple[str, float, float]]   # (label, start_s, end_s)
+    lead: str = DEFAULT_SIM_LEAD
+
+    @property
+    def duration(self) -> float:
+        return float(self.time[-1] - self.time[0]) if self.time.size else 0.0
+
+    @property
+    def reference_rate(self) -> Optional[float]:
+        """Mean Hexoskin breathing rate over the whole record (bpm), or None."""
+        seg = self.ref_br[np.isfinite(self.ref_br) & (self.ref_br > 0)]
+        return float(seg.mean()) if seg.size else None
+
+    def ref_rate_in(self, start_s: float, end_s: float) -> float:
+        """Mean reference breathing rate (bpm) in ``[start_s, end_s)``, or NaN."""
+        a, b = int(round(start_s * self.fs)), int(round(end_s * self.fs))
+        a, b = max(0, a), min(self.ref_br.size, b)
+        if b <= a:
+            return float("nan")
+        seg = self.ref_br[a:b]
+        seg = seg[np.isfinite(seg) & (seg > 0)]
+        return float(seg.mean()) if seg.size else float("nan")
+
+    def phase_at(self, t_s: float) -> Optional[str]:
+        for label, s, e in self.phases:
+            if s <= t_s < e:
+                return label
+        return None
+
+
+def _read_sim_phases(base: str, fs: float, sig_len: int) -> List[Tuple[str, float, float]]:
+    """Task-phase spans from the record's ``.aux`` event annotations.
+
+    Each phase's first marker wins (Walking/2-Back carry duplicate FAROS/Manual
+    markers a few seconds apart); a phase runs until the next phase starts, the
+    last until the end of the record.
+    """
+    import wfdb
+    try:
+        aux = wfdb.rdann(base, "aux")
+    except Exception:
+        return []
+    starts, seen = [], set()
+    for samp, note in zip(aux.sample, aux.aux_note):
+        tail = (note or "").split("/")[-1].strip()
+        if tail in SIM_PHASES and tail not in seen:
+            starts.append((tail, samp / fs))
+            seen.add(tail)
+    starts.sort(key=lambda x: x[1])
+    spans = []
+    for i, (label, s) in enumerate(starts):
+        e = starts[i + 1][1] if i + 1 < len(starts) else sig_len / fs
+        spans.append((label, s, e))
+    return spans
+
+
+def load_simultaneous_record(path: str, *, lead: str = DEFAULT_SIM_LEAD) -> SimultaneousRecord:
+    """Load one WFDB record from the five-devices dataset.
+
+    ``path`` is the record base or its ``.hea`` file. Only ``lead`` and the
+    Hexoskin breathing-rate reference channel are read.
+    """
+    import wfdb
+    base = str(path)
+    if base.endswith(".hea"):
+        base = base[:-4]
+    rec = wfdb.rdrecord(base, channel_names=[lead, SIMULTANEOUS_REF])
+    names = list(rec.sig_name)
+    sig = np.asarray(rec.p_signal, dtype=float)
+    ecg = sig[:, names.index(lead)]
+    ref_br = sig[:, names.index(SIMULTANEOUS_REF)]
+    fs = float(rec.fs)
+    time = np.arange(ecg.size) / fs
+    phases = _read_sim_phases(base, fs, ecg.size)
+    return SimultaneousRecord(os.path.basename(base), ecg, fs, time, ref_br,
+                              phases, lead)

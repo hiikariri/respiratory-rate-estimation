@@ -4,11 +4,15 @@ GUI for ECG-derived respiratory-rate estimation.
 Load an ECG recording from a dataset, then view:
   * the ECG with detected R-peaks, and
   * the ECG-derived respiration (EDR) signal with the detected breaths,
-    the estimated respiratory rate, and the error (MAE) against ground truth.
+    the estimated respiratory rate, and the error (MAE / MAPE) against ground truth.
 
-Supports both bundled dataset layouts:
+Supports three bundled dataset layouts:
   * BIDMC          -> ``*_Signals.csv`` (+ ``*_Breaths.csv`` ground truth)
   * dataset_primer -> ``*_ecg.csv``     (+ ``*_metadata.json`` ground truth)
+  * simultaneous   -> WFDB ``*.hea``    (five-devices set; Hexoskin breathing
+                      rate is the reference, with the four task phases shaded
+                      and a selectable ECG lead). Point the folder at the
+                      ``generated_data`` directory (or the dataset root).
 
 Run:
     python rr_gui.py
@@ -48,20 +52,34 @@ DEFAULT_DATASET = ds.BIDMC_DIR
 # Data helpers (bridge the two dataset layouts to one interface)
 # --------------------------------------------------------------------------- #
 def discover_records(folder):
-    """Return ``[(kind, path, name), ...]`` for every record in ``folder``."""
+    """Return ``[(kind, path, name), ...]`` for every record in ``folder``.
+
+    Finds the two CSV layouts plus WFDB ``*.hea`` records (the five-devices
+    set); if a ``generated_data`` subfolder exists it is searched too, so the
+    dataset root can be selected directly.
+    """
     folder = Path(folder)
     recs = []
     for f in sorted(folder.glob("*_Signals.csv")):
         recs.append(("bidmc", f, f.name[: -len("_Signals.csv")]))
     for f in sorted(folder.glob("*_ecg.csv")):
         recs.append(("primer", f, f.name[: -len("_ecg.csv")]))
+    hea_dirs = [folder]
+    sub = folder / "generated_data"
+    if sub.is_dir():
+        hea_dirs.append(sub)
+    for d in hea_dirs:
+        for f in sorted(d.glob("*.hea")):
+            recs.append(("simultaneous", f, f.stem))
     return recs
 
 
-def load_record(kind, path):
+def load_record(kind, path, lead=None):
     if kind == "bidmc":
         return ds.load_bidmc_record(str(path))
-    return ds.load_primer_record(str(path))
+    if kind == "primer":
+        return ds.load_primer_record(str(path))
+    return ds.load_simultaneous_record(str(path), lead=lead or ds.DEFAULT_SIM_LEAD)
 
 
 def short_label(name):
@@ -75,7 +93,25 @@ def window_ref_rate(rec, start, end):
     if isinstance(rec, ds.BidmcRecord):
         dur = end - start
         return rec.breaths_in(start, end) * 60.0 / dur if dur > 0 else np.nan
+    if isinstance(rec, ds.SimultaneousRecord):
+        return rec.ref_rate_in(start, end)       # mean Hexoskin BR in the window
     return rec.reference_rate if rec.reference_rate else np.nan  # primer: constant
+
+
+# Task-phase shading for the five-devices dataset.
+_PHASE_COLORS = {"Rest": "tab:blue", "Walking": "tab:green",
+                 "2-Back": "tab:orange", "Running": "tab:red"}
+
+
+def shade_phases(ax, phases, *, annotate=False):
+    """Shade task-phase spans on a time-axis plot (no-op when ``phases`` empty)."""
+    for label, s, e in phases or []:
+        ax.axvspan(s, e, color=_PHASE_COLORS.get(label, "0.5"), alpha=0.06, zorder=0)
+        if annotate:
+            ax.text(0.5 * (s + e), 0.99, label, transform=ax.get_xaxis_transform(),
+                    ha="center", va="top", fontsize=8, color="0.3",
+                    bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none",
+                              alpha=0.5))
 
 
 def ref_breath_times(rec):
@@ -166,6 +202,39 @@ class RRGui(QtWidgets.QMainWindow):
         self.window_spin.setSingleStep(2.0)
         self.window_spin.setValue(32.0)
         controls.addWidget(self.window_spin, 2, 3)
+
+        # ECG lead (multi-lead WFDB datasets) + respiration-band upper edge.
+        # Both feed the estimate, so they take effect on the next Estimate/Evaluate.
+        controls.addWidget(QtWidgets.QLabel("ECG lead"), 5, 0)
+        self.lead_combo = QtWidgets.QComboBox()
+        self.lead_combo.addItems(ds.SIMULTANEOUS_LEADS)
+        self.lead_combo.setToolTip(
+            "ECG channel to analyse for multi-lead WFDB records (five-devices "
+            "set). Ignored for single-lead CSV datasets.")
+        controls.addWidget(self.lead_combo, 5, 1)
+        controls.addWidget(QtWidgets.QLabel("Resp band hi (bpm)"), 5, 2)
+        self.resp_hi_spin = QtWidgets.QDoubleSpinBox()
+        self.resp_hi_spin.setRange(20.0, 60.0)
+        self.resp_hi_spin.setSingleStep(1.0)
+        self.resp_hi_spin.setValue(RESP_BAND[1] * 60.0)   # library default (30)
+        self.resp_hi_spin.setToolTip(
+            "Upper edge of the PSD respiration band. Library default is 30; "
+            "widen to ~45 for exercise data so fast breathing is not clipped.")
+        controls.addWidget(self.resp_hi_spin, 5, 3)
+
+        # Outlier rejection for "Evaluate all": drop records whose abs error
+        # vs the reference exceeds the threshold from the aggregate stats/plot.
+        self.outlier_check = QtWidgets.QCheckBox("Exclude if error >")
+        self.outlier_check.setToolTip(
+            "In 'Evaluate all', drop records whose absolute RR error exceeds "
+            "this many bpm from the aggregate MAE/MAPE/RMSE/plot.")
+        controls.addWidget(self.outlier_check, 5, 4)
+        self.outlier_spin = QtWidgets.QDoubleSpinBox()
+        self.outlier_spin.setRange(0.1, 100.0)
+        self.outlier_spin.setSingleStep(0.5)
+        self.outlier_spin.setValue(3.0)
+        self.outlier_spin.setSuffix(" bpm")
+        controls.addWidget(self.outlier_spin, 5, 5)
 
         # View window (crops both plots without recomputing)
         controls.addWidget(QtWidgets.QLabel("View start (s)"), 3, 0)
@@ -414,7 +483,7 @@ class RRGui(QtWidgets.QMainWindow):
                 progress.setValue(k)
                 QtWidgets.QApplication.processEvents()
                 try:
-                    rec = load_record(kind, path)
+                    rec = load_record(kind, path, self._selected_lead())
                     res = ECGSQAEngine(rec.ecg, rec.fs).assess()
                 except Exception:
                     n_failed += 1
@@ -479,6 +548,14 @@ class RRGui(QtWidgets.QMainWindow):
         self._update_exclude_status()
 
     # ----------------------------------------------------------------- #
+    def _selected_lead(self):
+        """ECG lead for WFDB records (ignored by the single-lead CSV loaders)."""
+        return self.lead_combo.currentText() or ds.DEFAULT_SIM_LEAD
+
+    def _resp_band(self):
+        """PSD respiration band (Hz) from the fixed low edge and the hi spinbox."""
+        return (RESP_BAND[0], self.resp_hi_spin.value() / 60.0)
+
     def estimate_and_plot(self):
         i = self.record_combo.currentIndex()
         if i < 0 or i >= len(self.records):
@@ -489,8 +566,9 @@ class RRGui(QtWidgets.QMainWindow):
         method = self.method_combo.currentText()
         window = self.window_spin.value()
         try:
-            rec = load_record(kind, path)
-            res = respiration_rate(rec.ecg, rec.fs, method=method, window=window)
+            rec = load_record(kind, path, self._selected_lead())
+            res = respiration_rate(rec.ecg, rec.fs, method=method, window=window,
+                                   resp_band=self._resp_band())
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Failed", str(exc))
             return
@@ -504,20 +582,25 @@ class RRGui(QtWidgets.QMainWindow):
                 ref.append(r)
         est, ref = np.asarray(est), np.asarray(ref)
         mae = float(np.mean(np.abs(est - ref))) if est.size else float("nan")
+        nz = ref != 0                            # MAPE undefined where ref == 0
+        mape = (float(np.mean(np.abs((est[nz] - ref[nz]) / ref[nz]))) * 100.0
+                if nz.any() else float("nan"))
         ref_overall = rec.reference_rate if rec.reference_rate else float("nan")
 
         excluded_tag = "  ⚠ EXCLUDED (bad data)" if self._is_excluded(name) else ""
+        lead_tag = f" ({rec.lead})" if isinstance(rec, ds.SimultaneousRecord) else ""
         self.metrics_label.setText(
-            f"{name} | fs {rec.fs:.0f} Hz | R-peaks {res.r_peaks.size} | "
+            f"{name}{lead_tag} | fs {rec.fs:.0f} Hz | R-peaks {res.r_peaks.size} | "
             f"RR estimated: {res.rate:.2f} bpm   "
             f"RR reference: {ref_overall:.2f} bpm   "
-            f"MAE: {mae:.2f} bpm ({est.size} window{'s' if est.size != 1 else ''})"
+            f"MAE: {mae:.2f} bpm   "
+            f"MAPE: {mape:.1f}% ({est.size} window{'s' if est.size != 1 else ''})"
             f"{excluded_tag}"
         )
-        self._last_plot = (rec, res, name, method, mae, ref_overall)
-        self._plot(rec, res, name, method, mae, ref_overall)
+        self._last_plot = (rec, res, name, method, mae, mape, ref_overall)
+        self._plot(rec, res, name, method, mae, mape, ref_overall)
 
-    def _plot(self, rec, res, name, method, mae, ref_overall):
+    def _plot(self, rec, res, name, method, mae, mape, ref_overall):
         time = rec.time
         source = self.source_combo.currentText()
         ecg = np.asarray(rec.ecg, dtype=float)
@@ -530,6 +613,11 @@ class RRGui(QtWidgets.QMainWindow):
         ax_ecg = self.figure.add_subplot(3, 1, 1)
         ax_edr = self.figure.add_subplot(3, 1, 2, sharex=ax_ecg)
         ax_psd = self.figure.add_subplot(3, 1, 3)   # frequency domain (own x-axis)
+
+        # --- task-phase shading (five-devices dataset; no-op otherwise) ---
+        phases = getattr(rec, "phases", None)
+        shade_phases(ax_ecg, phases, annotate=True)
+        shade_phases(ax_edr, phases)
 
         # --- ECG with R-peaks ---
         ax_ecg.plot(time, ecg, lw=0.7, color="tab:blue", label=f"ECG ({source})")
@@ -557,8 +645,8 @@ class RRGui(QtWidgets.QMainWindow):
                                label="annotated breaths" if j == 0 else None)
         ax_edr.set_title(
             f"EDR — RR estimated = {res.rate:.1f} bpm  |  "
-            f"RR reference = {ref_overall:.1f} bpm  |  MAE = {mae:.2f} bpm  "
-            f"(method = {method})"
+            f"RR reference = {ref_overall:.1f} bpm  |  MAE = {mae:.2f} bpm  |  "
+            f"MAPE = {mape:.1f}%  (method = {method})"
         )
         ax_edr.set_xlabel("Time (s)")
         ax_edr.set_ylabel("EDR (z-score)")
@@ -572,10 +660,11 @@ class RRGui(QtWidgets.QMainWindow):
         f, pxx = welch(edr0, fs=res.fs, nperseg=nperseg)
         bpm = f * 60.0
         ax_psd.plot(bpm, pxx, color="tab:purple", lw=1.2, label="EDR power spectrum")
-        lo, hi = RESP_BAND[0] * 60.0, RESP_BAND[1] * 60.0
+        band_hz = self._resp_band()
+        lo, hi = band_hz[0] * 60.0, band_hz[1] * 60.0
         ax_psd.axvspan(lo, hi, color="0.6", alpha=0.15,
                        label=f"respiration band ({lo:.0f}–{hi:.0f} bpm)")
-        band = (f >= RESP_BAND[0]) & (f <= RESP_BAND[1])
+        band = (f >= band_hz[0]) & (f <= band_hz[1])
         if band.any():
             f_peak = bpm[band][int(np.argmax(pxx[band]))]
             ax_psd.scatter([f_peak], [pxx[band].max()], s=40, c="tab:purple",
@@ -644,8 +733,9 @@ class RRGui(QtWidgets.QMainWindow):
                 n_excluded += 1
                 continue
             try:
-                rec = load_record(kind, path)
-                res = respiration_rate(rec.ecg, rec.fs, method=method, window=window)
+                rec = load_record(kind, path, self._selected_lead())
+                res = respiration_rate(rec.ecg, rec.fs, method=method, window=window,
+                                       resp_band=self._resp_band())
                 ref = rec.reference_rate
                 if not (ref and np.isfinite(ref)):
                     continue
@@ -661,16 +751,42 @@ class RRGui(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "No results", "No valid records.")
             return
 
+        n_outliers = 0
+        if self.outlier_check.isChecked():
+            threshold = self.outlier_spin.value()
+            keep = np.abs(ests - refs) <= threshold
+            n_outliers = int((~keep).sum())
+            if keep.any():
+                names = [n for n, k in zip(names, keep) if k]
+                ests, refs = ests[keep], refs[keep]
+            else:
+                QtWidgets.QMessageBox.warning(
+                    self, "No results",
+                    f"All records exceed the {threshold:.1f} bpm error threshold.")
+                return
+
         err = ests - refs
         mae = float(np.mean(np.abs(err)))
+        nz = refs != 0                           # MAPE undefined where ref == 0
+        mape = (float(np.mean(np.abs(err[nz] / refs[nz]))) * 100.0
+                if nz.any() else float("nan"))
         rmse = float(np.sqrt(np.mean(err ** 2)))
         bias = float(np.mean(err))
         corr = (float(np.corrcoef(ests, refs)[0, 1])
                 if ests.size > 1 and ests.std() and refs.std() else float("nan"))
+        # R2 score (coefficient of determination): 1 - SS_res/SS_tot, with the
+        # reference as truth. Negative when the estimator beats predicting the
+        # mean. Differs from r**2 (which ignores bias/scale).
+        ss_tot = float(np.sum((refs - refs.mean()) ** 2))
+        r2 = float(1.0 - np.sum(err ** 2) / ss_tot) if ss_tot > 0 else float("nan")
+        outlier_tag = f" (outliers {n_outliers})" if n_outliers else ""
         self.metrics_label.setText(
-            f"Dataset [{method}] | records {ests.size} (excluded {n_excluded}) | "
-            f"MAE {mae:.2f} | RMSE {rmse:.2f} | bias {bias:+.2f} | r {corr:.3f} bpm"
+            f"Dataset [{method}] | records {ests.size} (excluded {n_excluded}){outlier_tag} | "
+            f"MAE {mae:.2f} | MAPE {mape:.1f}% | RMSE {rmse:.2f} | "
+            f"bias {bias:+.2f} | r {corr:.3f} | R² {r2:.3f}"
         )
+
+        self._save_label_distribution(refs)
 
         # --- Plot: scatter (est vs ref) + per-record abs error ---
         self.figure.clear()
@@ -697,6 +813,30 @@ class RRGui(QtWidgets.QMainWindow):
         ax2.grid(alpha=0.3, axis="y")
 
         self.canvas.draw_idle()
+
+    def _save_label_distribution(self, refs):
+        """Save a histogram of the reference RR (label) values actually used
+        in the last 'Evaluate all' run to a PNG in the dataset folder.
+        Built off-screen (not shown on the GUI canvas); overwritten each run."""
+        fig = Figure(figsize=(8, 5), tight_layout=True)
+        ax = fig.add_subplot(1, 1, 1)
+        n_bins = min(15, max(5, refs.size // 2))
+        ax.hist(refs, bins=n_bins, color="tab:blue", alpha=0.7, label="reference RR (label)")
+        ax.axvline(float(refs.mean()), color="tab:blue", ls="--", lw=1.3,
+                   label=f"mean = {refs.mean():.1f} bpm")
+        ax.axvline(float(np.median(refs)), color="tab:cyan", ls=":", lw=1.3,
+                   label=f"median = {np.median(refs):.1f} bpm")
+        ax.set_xlabel("Reference RR (bpm)")
+        ax.set_ylabel("Count")
+        ax.set_title(f"Reference RR Distribution — Total Subject ({refs.size})")
+        ax.legend(loc="best")
+        ax.grid(alpha=0.3, axis="y")
+
+        path = self.dataset_dir / "rr_label_distribution.png"
+        try:
+            fig.savefig(path, dpi=150)
+        except OSError as exc:
+            self.metrics_label.setText(f"{self.metrics_label.text()}  [save failed: {exc}]")
 
 
 def main():

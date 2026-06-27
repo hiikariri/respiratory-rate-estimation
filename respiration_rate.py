@@ -65,8 +65,8 @@ __all__ = [
 EDR_LOWCUT = 5.0          # Hz, QRS band-pass low cut for amplitude extraction
 EDR_HIGHCUT = 40.0        # Hz, QRS band-pass high cut
 MIN_BREATH_INTERVAL = 1.17  # s, minimum spacing between breaths (-> max ~51 bpm)
-HEIGHT_FRAC = 0.95        # peak height threshold = HEIGHT_FRAC * mean(|edr window|)
-PROMINENCE_FRAC = 0.075   # prominence threshold = frac * (max_prom - min_prom)
+HEIGHT_FRAC = 0.35        # peak height threshold = HEIGHT_FRAC * mean(|edr window|)
+PROMINENCE_FRAC = 0.075   # prominence threshold = frac * signal_range
 RESP_BAND = (10 / 60.0, 30 / 60.0)  # Hz (10–30 brpm), plausible respiration band for the PSD method
 WINDOW = 32.0             # s, analysis window
 MIN_R_PEAKS = 4           # need at least this many R peaks to build an EDR signal
@@ -169,7 +169,7 @@ def compute_edr(
 
 
 # =============================================================================
-# Breath peak detection (the notebook's three-condition rule)
+# Breath peak detection
 # =============================================================================
 def count_breath_peaks(
     edr_window,
@@ -179,28 +179,22 @@ def count_breath_peaks(
     height_frac: float = HEIGHT_FRAC,
     prominence_frac: float = PROMINENCE_FRAC,
 ):
-    """Return indices of breath peaks within one EDR window.
-
-    A sample is accepted as a breath peak when it satisfies all three:
-      1. spacing  : at least ``min_breath_interval`` seconds from the previous,
-      2. height   : >= ``height_frac`` * mean(|window|),
-      3. prominence: >= ``prominence_frac`` * (max_prom - min_prom) over the
-         window's peaks.
-    """
+    """Return indices of breath peaks within one EDR window using scipy's find_peaks."""
     edr_window = np.asarray(edr_window, dtype=float)
     if edr_window.size < 3:
         return np.array([], dtype=int)
 
-    distance = max(1, int(round(min_breath_interval * fs)))
-
-    # First pass: every local maximum, to scale the prominence threshold.
-    all_peaks, props = find_peaks(edr_window, prominence=0)
-    if all_peaks.size == 0:
-        return np.array([], dtype=int)
-
-    proms = props["prominences"]
-    prominence_threshold = prominence_frac * (proms.max() - proms.min())
+    # 1. Height threshold based on mean absolute amplitude
     height_threshold = height_frac * np.mean(np.abs(edr_window))
+
+    # 2. Prominence threshold based on the signal's peak-to-peak range
+    # This is more robust than a 2-pass search because it's immune to finding zero initial peaks
+    signal_range = np.ptp(edr_window) 
+    prominence_threshold = prominence_frac * signal_range
+
+    # 3. Distance threshold
+    # Relaxed slightly (to 75% of minimum) to favor prominence over strict MPD locking
+    distance = max(1, int(round((min_breath_interval * 0.75) * fs)))
 
     peaks, _ = find_peaks(
         edr_window,
